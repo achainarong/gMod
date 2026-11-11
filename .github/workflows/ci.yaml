@@ -48,3 +48,9 @@ jobs:
 
     - name: Build binaries
       run: cmake --build build --config Release
+
+    - name: Upload gMod.dll
+      uses: actions/upload-artifact@v4
+      with:
+        name: gMod
+        path: bin/
