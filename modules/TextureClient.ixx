@@ -22,6 +22,7 @@ struct PendingOp {
     Kind kind;
     HashType hash;
     std::vector<BYTE> data;
+    std::function<std::vector<BYTE>()> load; // streaming packs: data is empty, load on first use
 };
 
 // Couples a value with the mutex guarding it; the value is only reachable while
@@ -59,7 +60,7 @@ public:
 
     void Initialize();
 
-    void EnqueueAdd(HashType hash, std::vector<BYTE> data);
+    void EnqueueAdd(HashType hash, std::vector<BYTE> data, std::function<std::vector<BYTE>()> load = {});
     void EnqueueRemove(HashType hash);
 
     static int AddFile(const std::filesystem::path& path);
@@ -285,20 +286,37 @@ int TextureClient::LoadTexture(TextureFileStruct* file_in_memory, IDirect3DBaseT
     *ppTexture = nullptr;
     *ppState = nullptr;
 
+    // Streaming packs hold only an index: read + convert the entry now. The bytes
+    // live only for this call; the created texture holds the only copy.
+    std::vector<BYTE> streamed;
+    if (file_in_memory->data.empty() && file_in_memory->load) {
+        if (file_in_memory->load_failed) {
+            return RETURN_TEXTURE_NOT_LOADED;
+        }
+        streamed = file_in_memory->load();
+        if (streamed.empty()) {
+            file_in_memory->load_failed = true;
+            Warning("LoadTexture (%#lX): streaming read FAILED\n", file_in_memory->crc_hash);
+            return RETURN_TEXTURE_NOT_LOADED;
+        }
+    }
+    const auto& bytes = streamed.empty() ? file_in_memory->data : streamed;
+
     // CreateDDSTextureFromMemoryEx calls the hooked CreateTexture; loading_fake
     // makes that hook register the result as a fake, not a game original.
     IDirect3DTexture9* texture = nullptr;
     loading_fake = true;
     const auto ret = DirectX::CreateDDSTextureFromMemoryEx(
         D3D9Device,
-        file_in_memory->data.data(),
-        file_in_memory->data.size(),
+        bytes.data(),
+        bytes.size(),
         0, D3DPOOL_MANAGED, false,
         &texture);
     loading_fake = false;
 
     if (ret != D3D_OK || texture == nullptr) {
-        Warning("LoadDDSTexture (%p, %#lX): FAILED ret: \n", file_in_memory->data.data(), file_in_memory->crc_hash, ret);
+        Warning("LoadDDSTexture (%p, %#lX): FAILED ret: \n", bytes.data(), file_in_memory->crc_hash, ret);
+        if (!streamed.empty()) file_in_memory->load_failed = true;
         return RETURN_TEXTURE_NOT_LOADED;
     }
 
@@ -418,10 +436,10 @@ int TextureClient::MergeUpdate()
     return UnlockMutex();
 }
 
-void TextureClient::EnqueueAdd(HashType hash, std::vector<BYTE> data)
+void TextureClient::EnqueueAdd(HashType hash, std::vector<BYTE> data, std::function<std::vector<BYTE>()> load)
 {
     if (!hash) return;
-    pending_ops.with([&](auto& ops) { ops.push_back(PendingOp{PendingOp::Kind::Add, hash, std::move(data)}); });
+    pending_ops.with([&](auto& ops) { ops.push_back(PendingOp{PendingOp::Kind::Add, hash, std::move(data), std::move(load)}); });
 }
 
 void TextureClient::EnqueueRemove(HashType hash)
@@ -440,6 +458,7 @@ void TextureClient::ProcessPendingOps()
             const auto texture_file_struct = new TextureFileStruct();
             texture_file_struct->crc_hash = op.hash;
             texture_file_struct->data = std::move(op.data);
+            texture_file_struct->load = std::move(op.load);
             modded_textures.emplace(op.hash, texture_file_struct);
             should_update = true;
         }
@@ -492,6 +511,24 @@ gsl::owner<TextureFileStruct*> MakeTextureFileStruct(TexEntry& entry, const bool
 {
     const auto texture_file_struct = new TextureFileStruct();
     texture_file_struct->crc_hash = entry.crc_hash;
+
+    if (entry.read) {
+        // Streaming entry: defer the read and the conversion to first use.
+        texture_file_struct->load = [read = std::move(entry.read), hash = entry.crc_hash, ext = entry.ext, compress]() -> std::vector<BYTE> {
+            TexEntry streamed_entry{read(), hash, ext};
+            if (streamed_entry.data.empty()) return {};
+            // Non-DDS inputs go through WIC, which needs COM on this (render) thread.
+            const bool needs_com = ext != ".dds";
+            const auto hr = needs_com ? CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED) : S_FALSE;
+            const auto dds_blob = TextureFunction::ConvertToCompressedDDS(streamed_entry, compress);
+            if (needs_com && SUCCEEDED(hr)) CoUninitialize();
+            const auto blob_ptr = static_cast<const BYTE*>(dds_blob.GetBufferPointer());
+            if (!blob_ptr) return {};
+            return {blob_ptr, blob_ptr + dds_blob.GetBufferSize()};
+        };
+        return texture_file_struct;
+    }
+
     const auto dds_blob = TextureFunction::ConvertToCompressedDDS(entry, compress);
     texture_file_struct->data.assign(static_cast<BYTE*>(dds_blob.GetBufferPointer()), static_cast<BYTE*>(dds_blob.GetBufferPointer()) + dds_blob.GetBufferSize());
     return texture_file_struct;
@@ -534,7 +571,7 @@ std::vector<HashType> TextureClient::IngestModfile(std::vector<gsl::owner<Textur
             hashes.push_back(hash);
             if (loaded_bytes) *loaded_bytes += texture_file_struct->data.size();
             if (current_client) {
-                current_client->EnqueueAdd(hash, std::move(texture_file_struct->data));
+                current_client->EnqueueAdd(hash, std::move(texture_file_struct->data), std::move(texture_file_struct->load));
             }
         }
         delete texture_file_struct;

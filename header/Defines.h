@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 // using HashType = DWORD32;
 using HashType = DWORD64;
 
@@ -27,11 +29,18 @@ struct TexEntry {
     std::vector<BYTE> data{};
     HashType crc_hash = 0; // hash value
     std::string ext{};
+    // Streaming packs only: reads this entry's bytes from its archive on demand
+    // (data stays empty until then).
+    std::function<std::vector<BYTE>()> read{};
 };
 
 struct TextureFileStruct {
     std::vector<BYTE> data{};
     HashType crc_hash = 0; // hash value
+    // Streaming packs only: produces the DDS on first use. data stays empty, so
+    // only textures the game actually binds ever occupy memory.
+    std::function<std::vector<BYTE>()> load{};
+    bool load_failed = false; // don't retry a broken entry on every lookup
 };
 
 inline void Message([[maybe_unused]] const char* format, ...)

@@ -39,6 +39,26 @@ namespace {
     }
 }
 
+namespace {
+    // Opt-in marker: a .zip containing an entry with this name is streamed. Only an
+    // index (hash -> entry name) is kept; each texture is read from disk the first
+    // time the game creates the original. Meant for large packs of ready-made,
+    // mipmapped BCn .dds files, which need no conversion at load time.
+    constexpr auto STREAM_MARKER = "gmod.stream";
+
+    // A streamed archive stays open for the whole session; entries are read from
+    // the render thread while startup threads may still be indexing other packs.
+    struct SharedArchive {
+        std::mutex mutex;
+        std::unique_ptr<libzippp::ZipArchive> zip;
+
+        ~SharedArchive()
+        {
+            if (zip) zip->close();
+        }
+    };
+}
+
 namespace HashCheck {
     export bool Use64BitCrc()
     {
@@ -107,16 +127,58 @@ std::vector<TexEntry> ModfileLoader::GetTpfContents() const
     return entries;
 }
 
+void ParseStreamingArchive(const std::shared_ptr<SharedArchive>& archive, std::vector<TexEntry>& entries)
+{
+    for (const auto& entry : archive->zip->getEntries()) {
+        if (!entry.isFile())
+            continue;
+        const auto entry_name = entry.getName();
+        if (entry_name == STREAM_MARKER)
+            continue;
+        const auto crc_hash = GetCrcFromFilename(entry_name);
+        if (!crc_hash) {
+            Warning("Entry with name %s could not be parsed", entry_name.c_str());
+            continue;
+        }
+        TexEntry tex_entry;
+        tex_entry.crc_hash = crc_hash;
+        tex_entry.ext = std::filesystem::path(entry_name).extension().string();
+        tex_entry.read = [archive, entry_name]() -> std::vector<BYTE> {
+            std::lock_guard lock(archive->mutex);
+            const auto zip_entry = archive->zip->getEntry(entry_name);
+            if (zip_entry.isNull() || !zip_entry.isFile())
+                return {};
+            const auto data_ptr = static_cast<BYTE*>(zip_entry.readAsBinary());
+            if (!data_ptr)
+                return {};
+            std::vector vec(data_ptr, data_ptr + zip_entry.getSize());
+            delete[] data_ptr;
+            return vec;
+        };
+        entries.push_back(std::move(tex_entry));
+    }
+}
+
 std::vector<TexEntry> ModfileLoader::GetFileContents() const
 {
     std::vector<TexEntry> entries;
 
-    libzippp::ZipArchive zip_archive(file_name.string());
-    zip_archive.open();
-    LoadEntries(zip_archive, entries);
-    zip_archive.close();
+    auto archive = std::make_shared<SharedArchive>();
+    archive->zip = std::make_unique<libzippp::ZipArchive>(file_name.string());
+    if (!archive->zip->open()) {
+        Warning("Failed to open zip file: %s\n", file_name.c_str());
+        return {};
+    }
 
-    return entries;
+    const auto marker = archive->zip->getEntry(STREAM_MARKER);
+    if (!marker.isNull() && marker.isFile()) {
+        // The read closures share ownership, keeping the archive open after we return.
+        ParseStreamingArchive(archive, entries);
+        return entries;
+    }
+
+    LoadEntries(*archive->zip, entries);
+    return entries; // last owner: ~SharedArchive closes the archive
 }
 
 void ParseSimpleArchive(const libzippp::ZipArchive& archive, std::vector<TexEntry>& entries)

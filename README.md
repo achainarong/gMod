@@ -19,6 +19,15 @@ Continuation of the uMod project to improve performance and stability. Integrate
 Each line in the modlist.txt is the full path to a mod you want to load (eg. `D:\uMod\Borderless Cartography Made Easy 2015 1.3.tpf`)
 gMod will load all these files on startup
 
+**Streaming packs (large texture packs)**
+
+Guild Wars is a 32-bit process, and gMod normally keeps every texture of every loaded pack in memory, so packs are limited to a few hundred MB in total.
+A `.zip` pack that contains an entry named `gmod.stream` (any content) is streamed instead: gMod keeps only an index of the pack and reads each texture from disk the first time the game uses it, so memory holds only the textures in use.
+
+- Use ready-made, mipmapped BCn (DXT1/DXT3/DXT5) `.dds` files: other formats are converted when first used, which causes stutter.
+- Store entries uncompressed (zip "store" method) for the fastest reads; the data is already compressed.
+- `.tpf` packs are never streamed.
+
 **Disclaimer about [Reshade](https://github.com/crosire/reshade)**
 
 Reshade in versions > 5.0.1 is known to cause glitches with TexMod, uMod and also gMod.
